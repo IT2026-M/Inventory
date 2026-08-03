@@ -2763,21 +2763,19 @@ function loadSampleData() {
 window.addEventListener('load', async ()=>{
   const ctx = getSPContext();
   if (!ctx) {
-    // Not opened from within SharePoint — there is no session to authenticate
-    // against and no list to read/write, so block the app instead of failing silently.
-    document.body.innerHTML = `
-      <div style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0d2137;color:#fff;font-family:'Cairo',sans-serif;text-align:center;padding:40px;">
-        <div style="max-width:480px;">
-          <div style="font-size:48px;margin-bottom:16px;">🔒</div>
-          <h2 style="margin-bottom:12px;">يجب فتح النظام من موقع SharePoint</h2>
-          <p style="opacity:0.8;line-height:1.8;">
-            هذا التطبيق يعتمد على تسجيل الدخول الخاص بمايكروسوفت 365. الرجاء فتحه
-            من الرابط الموجود على موقع SharePoint الخاص بالمؤسسة وليس كملف مستقل.
-          </p>
-        </div>
-      </div>`;
+    loadSampleData();
+    applySettings();
+    renderDashboard();
+    updateAlertBadge();
+
+    document.querySelectorAll('.modal-overlay').forEach(ov=>{
+      ov.addEventListener('click', (e)=>{
+        if(e.target===ov) ov.classList.remove('open');
+      });
+    });
+
     return;
-  }
+}
 
   spSiteUrl = ctx.siteUrl;
   currentSPUser = ctx;
