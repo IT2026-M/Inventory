@@ -434,7 +434,12 @@ textarea { resize:vertical; min-height:80px; }
   <div class="topbar">
     <div class="topbar-title" id="page-title">لوحة التحكم</div>
     <div class="topbar-actions">
-      <button class="topbar-btn" onclick="navigate('alerts')" title="التنبيهات">
+
+<button class="btn btn-primary" onclick="loginMicrosoft()">
+🔑 تسجيل دخول
+</button>
+
+<button class="topbar-btn">
         🔔 <span class="notif-dot" id="notif-dot" style="display:none"></span>
       </button>
       <button class="topbar-btn" title="البحث" onclick="openGlobalSearch()">🔍</button>
@@ -2830,6 +2835,38 @@ window.addEventListener('load', async ()=>{
     }
   });
 });
+const msalConfig = {
+    auth: {
+        clientId: "8a94f984-7ac5-49ca-9e11-9df9de6faf47",
+        authority: "https://login.microsoftonline.com/442fb281-218f-4622-8732-65ee0d6e35ea",
+        redirectUri: "https://careinventory.cef-eg.org"
+    }
+};
+
+const msalInstance = new msal.PublicClientApplication(msalConfig);
+
+async function loginMicrosoft() {
+
+    try {
+
+        const result = await msalInstance.loginPopup({
+            scopes: ["User.Read"]
+        });
+
+        alert(
+            "تم تسجيل الدخول بنجاح: " +
+            result.account.username
+        );
+
+    } catch (error) {
+
+        console.error(error);
+
+        alert("فشل تسجيل الدخول");
+
+    }
+
+}
 </script>
 </body>
 </html>
