@@ -1375,15 +1375,168 @@ function addAuditLog(action, detail, section) {
   saveDB();
 }
 
-function saveDB() {
-  try { localStorage.setItem('inventoryDB', JSON.stringify(DB)); } catch(e) {}
+// ============================================================
+// SHAREPOINT INTEGRATION
+// Replaces localStorage as the persistence layer so the data
+// lives centrally online (in a SharePoint list) instead of in
+// each user's browser. Requires this file to be opened from
+// within a SharePoint site (so _spPageContextInfo is available)
+// — see SETUP-TUTORIAL.md for how to configure the list.
+// ============================================================
+const SP_CONFIG = {
+  listName: 'InventoryAppData',        // SharePoint list that stores the data
+  adminGroupName: 'Inventory-Admins'   // SharePoint group granted admin rights
+};
+
+let spSiteUrl = null;
+let spEntityType = null;
+let spItemCache = {};      // { collectionKey: { id, etag } }
+let spDirtyKeys = new Set();
+let spSaveTimer = null;
+let currentSPUser = null;
+let isAdmin = false;
+
+function getSPContext() {
+  if (typeof _spPageContextInfo === 'undefined' || !_spPageContextInfo.webAbsoluteUrl) return null;
+  return {
+    siteUrl: _spPageContextInfo.webAbsoluteUrl,
+    loginName: _spPageContextInfo.userLoginName,
+    displayName: _spPageContextInfo.userDisplayName || _spPageContextInfo.userLoginName
+  };
 }
 
-function loadDB() {
+async function spGetDigest() {
+  const res = await fetch(`${spSiteUrl}/_api/contextinfo`, {
+    method: 'POST',
+    headers: { 'Accept': 'application/json;odata=verbose' },
+    credentials: 'same-origin'
+  });
+  if (!res.ok) throw new Error('digest-failed');
+  const data = await res.json();
+  return data.d.GetContextWebInformation.FormDigestValue;
+}
+
+async function spGetEntityType() {
+  if (spEntityType) return spEntityType;
+  const res = await fetch(`${spSiteUrl}/_api/web/lists/getbytitle('${SP_CONFIG.listName}')?$select=ListItemEntityTypeFullName`, {
+    headers: { 'Accept': 'application/json;odata=verbose' },
+    credentials: 'same-origin'
+  });
+  if (!res.ok) throw new Error('entitytype-failed');
+  const data = await res.json();
+  spEntityType = data.d.ListItemEntityTypeFullName;
+  return spEntityType;
+}
+
+async function spCreateItem(key, value) {
+  const digest = await spGetDigest();
+  const entityType = await spGetEntityType();
+  const res = await fetch(`${spSiteUrl}/_api/web/lists/getbytitle('${SP_CONFIG.listName}')/items`, {
+    method: 'POST',
+    headers: {
+      'Accept': 'application/json;odata=verbose',
+      'Content-Type': 'application/json;odata=verbose',
+      'X-RequestDigest': digest
+    },
+    credentials: 'same-origin',
+    body: JSON.stringify({
+      '__metadata': { 'type': entityType },
+      'Title': key,
+      'JSONData': JSON.stringify(value)
+    })
+  });
+  if (!res.ok) throw new Error('create-failed:' + key);
+  const data = await res.json();
+  spItemCache[key] = { id: data.d.Id, etag: data.d.__metadata.etag };
+}
+
+async function spUpdateItem(key, value) {
+  const cached = spItemCache[key];
+  if (!cached) { await spCreateItem(key, value); return; }
+  const digest = await spGetDigest();
+  const entityType = await spGetEntityType();
+  const res = await fetch(`${spSiteUrl}/_api/web/lists/getbytitle('${SP_CONFIG.listName}')/items(${cached.id})`, {
+    method: 'POST',
+    headers: {
+      'Accept': 'application/json;odata=verbose',
+      'Content-Type': 'application/json;odata=verbose',
+      'X-RequestDigest': digest,
+      'X-HTTP-Method': 'MERGE',
+      'IF-MATCH': cached.etag || '*'
+    },
+    credentials: 'same-origin',
+    body: JSON.stringify({
+      '__metadata': { 'type': entityType },
+      'JSONData': JSON.stringify(value)
+    })
+  });
+  if (res.status === 412) throw new Error('conflict:' + key); // someone else saved it first
+  if (!res.ok) throw new Error('update-failed:' + key);
+  const etagRes = await fetch(`${spSiteUrl}/_api/web/lists/getbytitle('${SP_CONFIG.listName}')/items(${cached.id})?$select=Id`, {
+    headers: { 'Accept': 'application/json;odata=verbose' }, credentials: 'same-origin'
+  });
+  const etagData = await etagRes.json();
+  spItemCache[key].etag = etagData.d.__metadata.etag;
+}
+
+async function spLoadAll() {
+  const res = await fetch(`${spSiteUrl}/_api/web/lists/getbytitle('${SP_CONFIG.listName}')/items?$select=Id,Title,JSONData&$top=5000`, {
+    headers: { 'Accept': 'application/json;odata=verbose' },
+    credentials: 'same-origin'
+  });
+  if (!res.ok) throw new Error('load-failed');
+  const data = await res.json();
+  const defaults = {
+    settings: DB.settings, warehouses: [], mainCategories: [], subCategories: [],
+    items: [], receipts: [], issues: [], transfers: [], projects: [],
+    movements: [], auditLog: [], backupLog: [], counters: { receipt: 1, issue: 1, transfer: 1 }
+  };
+  const found = {};
+  data.d.results.forEach(r => {
+    found[r.Title] = true;
+    spItemCache[r.Title] = { id: r.Id, etag: r.__metadata.etag };
+    try { DB[r.Title] = JSON.parse(r.JSONData); } catch(e) { /* keep default below */ }
+  });
+  for (const key of Object.keys(defaults)) {
+    if (!found[key]) { DB[key] = defaults[key]; await spCreateItem(key, defaults[key]); }
+  }
+}
+
+async function loadUserRole() {
   try {
-    const raw = localStorage.getItem('inventoryDB');
-    if (raw) { DB = JSON.parse(raw); applySettings(); }
-  } catch(e) {}
+    const res = await fetch(`${spSiteUrl}/_api/web/currentuser/groups`, {
+      headers: { 'Accept': 'application/json;odata=verbose' },
+      credentials: 'same-origin'
+    });
+    if (!res.ok) { isAdmin = false; return; }
+    const data = await res.json();
+    isAdmin = data.d.results.some(g => g.Title === SP_CONFIG.adminGroupName);
+  } catch(e) { isAdmin = false; }
+}
+
+function saveDB() {
+  // Debounced batch save: every call marks all collections dirty and
+  // (re)starts a short timer so rapid successive edits collapse into
+  // one round of SharePoint writes instead of one per keystroke/click.
+  Object.keys(DB).forEach(k => spDirtyKeys.add(k));
+  clearTimeout(spSaveTimer);
+  spSaveTimer = setTimeout(flushSave, 900);
+}
+
+async function flushSave() {
+  const keys = Array.from(spDirtyKeys);
+  spDirtyKeys.clear();
+  for (const key of keys) {
+    try {
+      await spUpdateItem(key, DB[key]);
+    } catch (e) {
+      if (String(e).startsWith('conflict')) {
+        showNotif('تعارض في البيانات', `تم تعديل "${key}" من مستخدم آخر في نفس الوقت. يُرجى تحديث الصفحة (F5) قبل المتابعة لتفادي فقدان البيانات.`, 'error');
+      } else {
+        showNotif('فشل الحفظ', `تعذر حفظ التغييرات على SharePoint (${key}). تحقق من الاتصال بالإنترنت وحاول مجددًا.`, 'error');
+      }
+    }
+  }
 }
 
 function openModal(id) { document.getElementById(id).classList.add('open'); }
@@ -1408,6 +1561,10 @@ const pageTitles = {
 };
 
 function navigate(page) {
+  if (page === 'settings' && !isAdmin) {
+    showNotif('صلاحيات غير كافية', 'صفحة الإعدادات متاحة لأعضاء مجموعة Inventory-Admins فقط', 'warning');
+    return;
+  }
   document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
   document.getElementById('page-'+page).classList.add('active');
@@ -1449,6 +1606,7 @@ function renderSettings() {
   document.getElementById('set-accent-color').value = DB.settings.accentColor || '#d4ac0d';
   document.getElementById('set-expiry-days').value = DB.settings.expiryWarnDays || 30;
   document.getElementById('set-username').value = DB.settings.username || 'المدير';
+  document.getElementById('set-username').disabled = true; // identity now comes from Microsoft 365 sign-in
   updateDatePreview();
 
   document.getElementById('set-date-format').onchange = updateDatePreview;
@@ -2602,12 +2760,58 @@ function loadSampleData() {
 // ============================================================
 // INIT
 // ============================================================
-window.addEventListener('load', ()=>{
-  loadDB();
-  loadSampleData();
+window.addEventListener('load', async ()=>{
+  const ctx = getSPContext();
+  if (!ctx) {
+    // Not opened from within SharePoint — there is no session to authenticate
+    // against and no list to read/write, so block the app instead of failing silently.
+    document.body.innerHTML = `
+      <div style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0d2137;color:#fff;font-family:'Cairo',sans-serif;text-align:center;padding:40px;">
+        <div style="max-width:480px;">
+          <div style="font-size:48px;margin-bottom:16px;">🔒</div>
+          <h2 style="margin-bottom:12px;">يجب فتح النظام من موقع SharePoint</h2>
+          <p style="opacity:0.8;line-height:1.8;">
+            هذا التطبيق يعتمد على تسجيل الدخول الخاص بمايكروسوفت 365. الرجاء فتحه
+            من الرابط الموجود على موقع SharePoint الخاص بالمؤسسة وليس كملف مستقل.
+          </p>
+        </div>
+      </div>`;
+    return;
+  }
+
+  spSiteUrl = ctx.siteUrl;
+  currentSPUser = ctx;
+
+  const overlay = document.createElement('div');
+  overlay.id = 'sp-loading-overlay';
+  overlay.style.cssText = 'position:fixed;inset:0;background:#f0f4f8;display:flex;align-items:center;justify-content:center;z-index:9999;font-family:Cairo,sans-serif;color:#1a5276;font-size:16px;';
+  overlay.textContent = 'جارِ تحميل البيانات من SharePoint...';
+  document.body.appendChild(overlay);
+
+  try {
+    await spLoadAll();
+    await loadUserRole();
+  } catch (e) {
+    overlay.textContent = 'تعذر الاتصال بقاعدة البيانات على SharePoint. تحقق من الصلاحيات أو الاتصال بالإنترنت ثم أعد تحميل الصفحة.';
+    return;
+  }
+
+  // Real, non-editable identity for audit logging — replaces the manually-typed name
+  DB.settings.username = currentSPUser.displayName;
+
+  if (!isAdmin) {
+    document.querySelectorAll('.nav-item').forEach(el => {
+      const oc = el.getAttribute('onclick');
+      if (oc && oc.includes("'settings'")) el.style.display = 'none';
+    });
+  }
+
+  loadSampleData(); // only seeds demo data if the SharePoint list came back empty
   applySettings();
   renderDashboard();
   updateAlertBadge();
+  overlay.remove();
+
   // Close modals on overlay click
   document.querySelectorAll('.modal-overlay').forEach(ov=>{
     ov.addEventListener('click', (e)=>{ if(e.target===ov) ov.classList.remove('open'); });
